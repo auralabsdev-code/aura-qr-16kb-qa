@@ -1,0 +1,138 @@
+name: AuraQR QA runtime 16 KB
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auraqr-runtime-16kb
+  cancel-in-progress: false
+
+jobs:
+  runtime-16kb:
+    if: github.repository == 'auralabsdev-code/aura-qr-16kb-qa' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.run_attempt == '1'
+    environment: private-aab
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout del laboratorio
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Obtener el AAB privado
+        shell: bash
+        env:
+          ARTIFACT_PAT: ${{ secrets.AURAQR_ARTIFACT_PAT }}
+          SOURCE_REPO: ${{ secrets.AURAQR_SOURCE_REPOSITORY }}
+          SOURCE_RUN: ${{ secrets.AURAQR_SOURCE_RUN }}
+          SOURCE_ARTIFACT: ${{ secrets.AURAQR_SOURCE_ARTIFACT }}
+          SOURCE_SHA: ${{ secrets.AURAQR_SOURCE_COMMIT }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/auraqr-16kb-evidence"
+          printf 'stage=private_input\n' > "$RUNNER_TEMP/auraqr-16kb-evidence/result.txt"
+          python3 - <<'PY'
+          import hashlib
+          import io
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          from urllib.error import HTTPError
+          from urllib.parse import urlsplit
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
+          import zipfile
+
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, *args):
+                  return None
+
+          def require(condition):
+              if not condition:
+                  raise ValueError('Entrada o evidencia inesperada')
+
+          def https_location(value):
+              require(value is not None)
+              url = urlsplit(value)
+              require(url.scheme == 'https' and url.hostname and not url.username and not url.password)
+              return value
+
+          try:
+              token = os.environ['ARTIFACT_PAT']
+              repo = os.environ['SOURCE_REPO']
+              run = os.environ['SOURCE_RUN']
+              artifact = os.environ['SOURCE_ARTIFACT']
+              commit = os.environ['SOURCE_SHA']
+              require(token.startswith('github_pat_'))
+              require(re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo))
+              require(run.isdecimal() and artifact.isdecimal() and re.fullmatch(r'[a-f0-9]{40}', commit))
+              endpoint = f'https://api.github.com/repos/{repo}/actions/artifacts/{artifact}'
+              headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'}
+              api = build_opener(NoRedirect())
+              with api.open(Request(endpoint, headers=headers), timeout=20) as response:
+                  metadata = json.load(response)
+              require(metadata['id'] == int(artifact) and metadata['expired'] is False)
+              require(metadata['workflow_run']['id'] == int(run))
+              require(metadata['workflow_run']['head_sha'] == commit)
+              try:
+                  api.open(Request(endpoint + '/zip', headers=headers), timeout=20).close()
+                  raise ValueError('Se esperaba redirección de descarga')
+              except HTTPError as error:
+                  require(error.code == 302)
+                  location = https_location(error.headers.get('Location'))
+              # Separate requests never carry Authorization and never follow redirects automatically.
+              for _ in range(6):
+                  try:
+                      with api.open(Request(location), timeout=90) as response:
+                          archive = response.read(90 * 1024 * 1024 + 1)
+                      break
+                  except HTTPError as error:
+                      require(error.code in (301, 302, 303, 307, 308))
+                      location = https_location(error.headers.get('Location'))
+              else:
+                  raise ValueError('Demasiadas redirecciones de descarga')
+              require(len(archive) <= 90 * 1024 * 1024)
+              require(metadata['digest'] == 'sha256:' + hashlib.sha256(archive).hexdigest())
+              name = 'AuraQR_0.1.4_12_PRODUCTION.aab'
+              destination = Path(os.environ['RUNNER_TEMP']) / 'auraqr-16kb-input'
+              destination.mkdir(mode=0o700)
+              with zipfile.ZipFile(io.BytesIO(archive)) as z:
+                  require(sorted(z.namelist()) == sorted([name, 'result.json', 'SHA256SUMS.txt']))
+                  require(z.getinfo(name).file_size <= 90 * 1024 * 1024)
+                  with z.open(name) as source, (destination / name).open('xb') as output:
+                      shutil.copyfileobj(source, output)
+              print('Paquete privado recuperado y hash ZIP verificado')
+          except HTTPError as error:
+              raise SystemExit(f'Descarga privada detenida. HTTP {error.code}') from None
+          except Exception as error:
+              raise SystemExit(f'Descarga privada detenida. {type(error).__name__}') from None
+          PY
+
+      - name: Ensayar instalación y dos arranques sin Internet
+        shell: bash
+        run: bash qa_production_16kb.sh
+
+      - name: Retirar insumos privados
+        if: always()
+        shell: bash
+        run: rm -rf -- "${RUNNER_TEMP:?}/auraqr-16kb-input"
+
+      - name: Conservar solo evidencia filtrada
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: auraqr-runtime-16kb-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/auraqr-16kb-evidence/result.txt
+            ${{ runner.temp }}/auraqr-16kb-evidence/checks.txt
+            ${{ runner.temp }}/auraqr-16kb-evidence/SHA256SUMS.txt
+            ${{ runner.temp }}/auraqr-16kb-evidence/image.txt
+            ${{ runner.temp }}/auraqr-16kb-evidence/incidents.txt
+            ${{ runner.temp }}/auraqr-16kb-evidence/launch-1.txt
+            ${{ runner.temp }}/auraqr-16kb-evidence/launch-2.txt
+          retention-days: 7
+          if-no-files-found: warn
